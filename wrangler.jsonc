@@ -1,0 +1,51 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "cfworker-acme",
+  "main": "src/cfapp.ts",
+  "compatibility_date": "2025-03-10",
+  "compatibility_flags": [
+    "nodejs_compat"
+  ],
+  "vars": {
+    "DB_SOURCE": "d1",
+    "MAIL_KEYS": "wewe",
+    "MAIL_SEND": "noreply@example.com",
+    "AUTH_KEYS": "we",
+    "SITE_KEYS": "ew",
+    "DCV_AGENT": "we",
+    "DCV_EMAIL": "account@example.com",
+    "DCV_TOKEN": "we",
+    "DCV_ZONES": "we",
+    "GTS_useIt": "we",
+    "GTS_keyMC": "ew",
+    "GTS_keyID": "we",
+    "GTS_KeyTS": "ew",
+    "SSL_useIt": "true",
+    "SSL_keyMC": "ew",
+    "SSL_keyID": "ew",
+    "SSL_KeyTS": "we",
+    "ZRO_useIt": "true",
+    "ZRO_keyMC": "ew",
+    "ZRO_keyID": "ew",
+    "ZRO_KeyTS": "ew"
+  },
+  "site": {
+    "bucket": "./public"
+  },
+  "d1_databases": [
+    {
+      "binding": "DB_CF",
+      "database_name": "DB_CF",
+      "database_id": "b71eadd8-c426-4dc7-8d22-c85022110f3a"
+    }
+  ],
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1
+  },
+  "triggers": {
+    "crons": [
+      "*/1 * * * *"
+    ]
+  }
+}

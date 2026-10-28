@@ -1,0 +1,633 @@
+import * as acme from 'acme-client';
+import {Client} from "acme-client";
+import * as saves from './saves'
+import * as index from './index'
+import * as agent from "./agent";
+import * as query from "./query";
+import {Bindings} from './index'
+import {hmacSHA2} from "./users";
+import {errors} from "wrangler";
+import {readConf} from "./db/conf";
+
+
+const acme_url_map: Record<string, any> = {
+    "lets-encrypt": acme.directory.letsencrypt.production,
+    // "lets-encrypt": "https://encrys.524228.xyz/directory",
+    "google-trust": acme.directory.google.production,
+    "bypass-trust": acme.directory.buypass.production,
+    "zeroca-trust": acme.directory.zerossl.production,
+    "sslcom-trust": "https://acme.ssl.com/sslcom-dv-",
+}
+
+// 错误消息提取 ====================================================================================
+// 针对 acme-client / xior 抛出的错误对象，优先抽取 ACME Problem Details 中的友好信息，
+// 方便写入订单 text 字段后展示给用户。
+export function extractAcmeError(e: any): string {
+    if (!e) return "未知错误";
+    try {
+        // xior / axios 风格：错误对象自带 response.data
+        const resp = e.response ?? e?.config?.response;
+        const data = resp?.data;
+        // 附加的 HTTP / URL 上下文（便于排查）
+        const status: any = resp?.status ?? e?.status;
+        const statusText: string = resp?.statusText ?? e?.statusText ?? "";
+        const url: string = e?.request?.url ?? e?.config?.url ?? resp?.url ?? "";
+        const ctxParts: string[] = [];
+        if (status) ctxParts.push(`HTTP ${status}${statusText ? " " + statusText : ""}`);
+        if (url) ctxParts.push(url);
+        const ctx = ctxParts.length ? ` [${ctxParts.join(" @ ")}]` : "";
+
+        if (data) {
+            // 1) RFC 8555 Problem Details: { type, detail, status, subproblems }
+            if (typeof data === "object") {
+                const detail = data.detail || data.Detail || "";
+                const type = data.type || data.Type || "";
+                const subs: any[] = Array.isArray(data.subproblems) ? data.subproblems : [];
+                const subText = subs
+                    .map((s) => {
+                        const id = s?.identifier?.value ? `[${s.identifier.value}] ` : "";
+                        return id + (s?.detail || s?.type || "");
+                    })
+                    .filter(Boolean)
+                    .join("; ");
+                const core = [detail, subText].filter(Boolean).join(" | ");
+                if (core) return (type ? `${core} (${type})` : core) + ctx;
+                if (type) return type + ctx;
+                // 无 detail/type 时，把对象序列化做兜底
+                try {
+                    const jsonStr = JSON.stringify(data);
+                    if (jsonStr && jsonStr !== "{}") return jsonStr + ctx;
+                } catch { /* ignore */ }
+            }
+            // 2) 纯文本响应（典型：Cloudflare 网关返回的 `error code: 525` 等）
+            if (typeof data === "string" && data.trim()) {
+                const text = data.trim();
+                // 识别 Cloudflare 错误码，给出更友好的中文提示
+                const cfMatch = text.match(/error code:\s*(\d{3,4})/i);
+                if (cfMatch) {
+                    const code = cfMatch[1];
+                    const cfHint: Record<string, string> = {
+                        "520": "网关返回空响应",
+                        "521": "源站拒绝连接",
+                        "522": "源站连接超时",
+                        "523": "源站不可达",
+                        "524": "源站响应超时",
+                        "525": "SSL 握手失败（源站 TLS 配置异常）",
+                        "526": "源站 SSL 证书无效",
+                        "527": "Railgun 连接中断",
+                    };
+                    const hint = cfHint[code] || "网关错误";
+                    return `Cloudflare ${code} ${hint}：${text}${ctx}`;
+                }
+                return text + ctx;
+            }
+        }
+        // 3) acme-client 的 HTTPError / 普通 Error
+        if (e.message) return String(e.message) + ctx;
+        // 4) 完全无结构：尽力序列化
+        try {
+            const s = JSON.stringify(e);
+            if (s && s !== "{}") return s + ctx;
+        } catch { /* ignore */ }
+        return "未知错误" + ctx;
+    } catch {
+        return e?.message ? String(e.message) : String(e);
+    }
+}
+
+// 整体处理进程 ====================================================================================
+export async function Processing(env: Bindings) {
+    let order_list: any = await saves.selectDB(env.DB_CF, "Apply", {flag: {value: 5, op: "!="}});
+    let result: any[] = []
+    for (const id in order_list) { // 获取信息 ==================================================================
+        let order_info = order_list[id]; // 获取当前订单详细情况
+        let order_mail = order_info['mail']; // 当前订单用户邮箱
+        let order_user: any = (await saves.selectDB( // 查询申请者信息
+            env.DB_CF, "Users", {mail: {value: order_mail}}))[0]; // 按不同阶段分配程序处理 ========================
+        if (order_info['flag'] == 0) result.push(await newApply(env, order_user, order_info));// 执行创建订单操作
+        if (order_info['flag'] == 1) result.push(await setApply(env, order_user, order_info));// 自动执行域名代理
+        if (order_info['flag'] == 2) result.push(await opDomain(env, order_user, order_info, []));// 自动验证域名
+        if (order_info['flag'] == 3) result.push(await dnsAuthy(env, order_user, order_info));// 自动执行域名验证
+        if (order_info['flag'] == 4) result.push(await getCerts(env, order_user, order_info));// 自动执行获取证书
+    } // ========================================================================================================
+    return result;
+}
+
+// 单订单一键推进 ==================================================================================
+// 按当前 flag 循环推进状态机，直到进入需要外部介入的节点：
+// - flag=2  需要用户配置 DNS（等用户触发验证）
+// - flag=5  证书签发完成
+// - flag=-1 失败
+// - 或中间某步 flag 未发生变化（避免死循环）
+export async function processOne(env: Bindings, order_uuid: string) {
+    let result: any[] = [];
+    // 自愈检查：订单已创建（data 存在）但 list 中某些域名 auth 缺失，则强制回到 flag=1 重跑 setApply
+    {
+        let cur: any = (await saves.selectDB(
+            env.DB_CF, "Apply", {uuid: {value: order_uuid}}))[0];
+        if (cur && cur['data'] && cur['list']) {
+            let cur_flag = Number(cur['flag']);
+            if (cur_flag >= 1 && cur_flag < 4) { // 只对尚未开始验证的中间态做自愈
+                try {
+                    let list_items: any[] = JSON.parse(cur['list']) || [];
+                    let need_repair = list_items.length > 0 && list_items.some((it: any) => {
+                        let auth_val = (it && (it['auth'] || it['text'])) || "";
+                        return !auth_val;
+                    });
+                    if (need_repair && cur_flag !== 1) {
+                        await saves.updateDB(env.DB_CF, "Apply", {flag: 1}, {uuid: order_uuid});
+                        console.log("processOne self-heal: reset flag=1 for order " + order_uuid);
+                    }
+                } catch (e) {
+                    console.error("processOne self-heal parse error:", e);
+                }
+            }
+        }
+    }
+    for (let i = 0; i < 8; i++) { // 最多推进 8 步，防止极端情况死循环
+        let order_info: any = (await saves.selectDB(
+            env.DB_CF, "Apply", {uuid: {value: order_uuid}}))[0];
+        if (!order_info) break;
+        let flag = Number(order_info['flag']);
+        if (flag === 2 || flag === 5 || flag < 0) break; // 终止条件
+        let order_user: any = (await saves.selectDB(
+            env.DB_CF, "Users", {mail: {value: order_info['mail']}}))[0];
+        try {
+            if (flag === 0) result.push(await newApply(env, order_user, order_info));
+            else if (flag === 1) result.push(await setApply(env, order_user, order_info));
+            else if (flag === 3) result.push(await dnsAuthy(env, order_user, order_info));
+            else if (flag === 4) result.push(await getCerts(env, order_user, order_info));
+            else break; // 其它未知状态，停止推进
+        } catch (e) {
+            const msg = extractAcmeError(e);
+            console.error("processOne error at flag=" + flag + ":", e);
+            // 将错误信息持久化到订单，供前端展示
+            try {
+                await saves.updateDB(env.DB_CF, "Apply",
+                    {flag: -1, text: "处理失败: " + msg},
+                    {uuid: order_uuid});
+            } catch (ue) {
+                console.error("processOne persist error failed:", ue);
+            }
+            result.push({"texts": "处理失败: " + msg});
+            break;
+        }
+        // 若本轮处理后 flag 未推进，防止死循环
+        let next_info: any = (await saves.selectDB(
+            env.DB_CF, "Apply", {uuid: {value: order_uuid}}))[0];
+        if (!next_info || Number(next_info['flag']) === flag) break;
+    }
+    return result;
+}
+
+// 新增证书订单 =====================================================================================
+export async function newApply(env: Bindings, order_user: any, order_info: any) {
+    // 获取申请域名信息 =============================================================================
+    let client_data: any = await getStart(env, order_user, order_info); // 获取域名证书的申请操作接口
+    if (client_data == null) return {"texts": "处理失败，详见日志输出"};
+    let domain_list: any = await getNames(order_info, true) // 获取当前申请域名的详细信息和类型
+    // console.log("domain_list: ", domain_list);
+    try {
+        let orders_data: any = JSON.stringify(await client_data.createOrder({identifiers: domain_list}));
+        // 写入订单详细数据 =============================================================================
+        const timestamp = new Date(new Date().setDate(new Date().getDate() + 7)).getTime();
+        await saves.updateDB(env.DB_CF, "Apply", {flag: 1}, {uuid: order_info['uuid']}) // 更改状态码
+        await saves.updateDB(env.DB_CF, "Apply", {next: timestamp}, {uuid: order_info['uuid']})
+        await saves.updateDB(env.DB_CF, "Apply", {text: "订单创建成功"}, {uuid: order_info['uuid']})
+        await saves.updateDB(env.DB_CF, "Apply", {data: orders_data}, {uuid: order_info['uuid']})
+    } catch (e) {
+        const msg = extractAcmeError(e);
+        console.error("newApply createOrder failed:", e);
+        // 记录到订单：标记失败 + 写入明确错误原因，便于前端显示
+        try {
+            await saves.updateDB(env.DB_CF, "Apply",
+                {flag: -1, text: "订单创建失败: " + msg},
+                {uuid: order_info['uuid']});
+        } catch (ue) {
+            console.error("newApply persist error failed:", ue);
+        }
+        // 包装后再抛出，调用方（processOne）可直接使用
+        const wrapped: any = new Error(msg);
+        wrapped.cause = e;
+        throw wrapped;
+    }
+    return {"texts": "处理成功"};
+    // ==============================================================================================
+}
+
+// 自动验证代理 =====================================================================================
+export async function setApply(env: Bindings, order_user: any, order_info: any) {
+    let domain_list: any = order_info['list'];
+    let orders_text: any = JSON.parse(order_info['data'])
+    let client_data: any = await getStart(env, order_user, order_info);
+    let orders_data: any = await client_data.getOrder(orders_text); // 获取授权信息
+    // console.log(domain_list, orders_data);
+    // 执行验证部分 ================================================================================
+    let author_save: Record<string, Record<string, any>> = await getAuthy(client_data, orders_data)
+    let domain_save: any[] = []
+    let domain_flag: number = 2
+    let domain_text: string = ""
+    for (let domain_item of JSON.parse(domain_list)) {
+        if (domain_item['type'] == "dns-auto") {
+            await agent.dnsDel(env, domain_item['auto']); // 删除原来
+        }
+    }
+    for (let domain_item of JSON.parse(domain_list)) {
+        let domain_name = domain_item.name;
+        // if (domain_item.wild) domain_name = "*." + domain_name
+        // console.log(domain_name, author_save, author_save[domain_name]);
+        if (author_save[domain_name] == undefined) {
+            // 未拿到挑战：保留原条目但标记未就绪，触发下次自愈重试覆盖写入
+            domain_item['auth'] = domain_item['auth'] || "";
+            domain_item.flag = 1;
+            domain_flag = 1;
+            domain_text += domain_item.name + ": 未获取到验证挑战，稍后重试；";
+            domain_save.push(domain_item);
+            continue;
+        }
+        // console.log(author_save);
+        domain_item['auth'] = author_save[domain_name]['text'];
+        // 对于http-01验证（web-self），额外保存token用于前端展示验证路径
+        if (author_save[domain_name]['data']?.type === 'http-01') {
+            domain_item['token'] = author_save[domain_name]['data']['token'];
+        }
+        domain_item.flag = 2
+        if (domain_item['type'] == "dns-auto") {
+            let domain_auto = await hmacSHA2(domain_name.replaceAll("*.", ""), order_user['mail'])
+            const dcvAgent = (await readConf(env as any, "DCV_AGENT")) ?? ""
+            domain_item['auto'] = domain_auto.substring(0, 16) + "." + dcvAgent
+            // console.log(domain_item['auto'])
+            try { // 设置域名内容 ====================================================
+                let data: Record<string, any> = await agent.dnsAdd(
+                    env, domain_item, domain_name);
+                if (!data['success']) {
+                    domain_item.flag = 1
+                    domain_flag = 1
+                    domain_text += domain_item.name +
+                        ": 无法设置DNS记录: " + data['errors'][0]['message'].toString()
+                }
+            } catch (error) {
+                console.error('Error:', error);
+            }
+        }
+        // console.log(domain_item);
+        domain_save.push(domain_item);
+    }
+    if (domain_text.length == 0) domain_text = "域名处理成功"
+    await saves.updateDB(env.DB_CF, "Apply", {list: JSON.stringify(domain_save)}, {uuid: order_info['uuid']})
+    await saves.updateDB(env.DB_CF, "Apply", {flag: domain_flag}, {uuid: order_info['uuid']})
+    await saves.updateDB(env.DB_CF, "Apply", {text: domain_text}, {uuid: order_info['uuid']})
+    // console.log(domain_save);
+    return {"texts": domain_text};
+}
+
+// 修改验证状态 =====================================================================================
+export async function opDomain(env: Bindings, order_user: any, order_info: any, sets_list: string[]) {
+    let domain_list: any = order_info['list'];
+    // 执行操作部分 =================================================================================
+    let domain_save: any[] = []
+    let domain_flag: number = 3
+    for (let domain_item of JSON.parse(domain_list)) {
+        // console.log(domain_item, sets_list);
+        // console.log(sets_list.some(item => item.toLowerCase() === domain_item.name.toLowerCase()));
+        if (domain_item.flag >= 4) {
+            domain_save.push(domain_item);
+            continue;
+        }
+        if (sets_list.some(item => item.toLowerCase() === domain_item.name.toLowerCase()
+            || item.toLowerCase() === "all")) {
+            domain_item.flag = 3;
+        } else domain_flag = 2;
+        if (sets_list.length == 0 && domain_item.flag == 3) {
+            await dnsAuthy(env, order_user, order_info);
+            break;
+        }
+        domain_save.push(domain_item);
+    }
+    if (sets_list.length !== 0) {
+        await saves.updateDB(env.DB_CF, "Apply", {list: JSON.stringify(domain_save)}, {uuid: order_info['uuid']})
+        await saves.updateDB(env.DB_CF, "Apply", {text: "订单域名验证状态修改成功"}, {uuid: order_info['uuid']})
+        await saves.updateDB(env.DB_CF, "Apply", {flag: domain_flag}, {uuid: order_info['uuid']})
+    }
+    return {"texts": "处理成功"};
+}
+
+// 执行域名验证 ====================================================================================
+export async function dnsAuthy(env: Bindings, order_user: any, order_info: any) {
+    let domain_list: any = order_info['list'];
+    let orders_text: any = JSON.parse(order_info['data'])
+    let client_data: any = await getStart(env, order_user, order_info);
+    let orders_data: any = await client_data.getOrder(orders_text); // 获取授权信息
+    let author_save: Record<string, Record<string, any>> = await getAuthy(client_data, orders_data)
+    // 验证所有域名 ================================================================================
+    let domain_save: any[] = [] // 需要最后保存的域名详细验证数据
+    let status_flag: number = 4;
+    let domain_fail: string[] = [];
+    for (let domain_item of JSON.parse(domain_list)) { // 验证DNS
+        // web-self（http-01验证）不需要DNS检查，直接提交验证
+        let author_flag: boolean = domain_item.type === "web-self"
+            ? (author_save[domain_item.name] != undefined)
+            : await dnsCheck(author_save, domain_item)
+        if (status_flag == -1) {
+            domain_save.push(domain_item);
+            continue
+        }
+        console.log(domain_item.name, author_flag);
+        if (!author_flag) { // 本地验证失败 ========================================================
+            domain_item.flag = 2;
+            status_flag = 2
+        } else { // 本地验证成功 =====================================================================
+            let author_data: Record<string, any> = author_save[domain_item.name]
+            if (author_data.data['status'] == "invalid") { // 已有验证失败
+                domain_item.flag = -1;
+                status_flag = -1;
+            }
+            if (author_data.data['status'] == 'pending') {
+                try {
+                    let upload_flag: boolean = await client_data.verifyChallenge(author_data.auth, author_data.data);
+                    console.log('Domain Server Verify Status:', upload_flag);
+                    let submit_flag = await client_data.completeChallenge(author_data.data);
+                    console.log('Domain Remote Upload Status:', submit_flag['status']);
+                    let result_flag = await client_data.waitForValidStatus(author_data.data);
+                    console.log('Domain Remote Verify Status:', result_flag['status']);
+                    if (result_flag.status == "valid") {
+                        domain_item.flag = 4;
+                    }
+                } catch (error) {
+                    console.log('Domain Remote Verify Errors:', error);
+                    domain_item.flag = -1;
+                    status_flag = -1;
+                }
+            }
+            if (author_data.data['status'] == 'valid') {
+                domain_item.flag = 4;
+            }
+        }
+        domain_save.push(domain_item);
+    }
+    orders_data = await client_data.getOrder(orders_text);
+    // console.log(orders_data);
+    await saves.updateDB(env.DB_CF, "Apply", {data: JSON.stringify(orders_data)}, {uuid: order_info['uuid']})
+    await saves.updateDB(env.DB_CF, "Apply", {list: JSON.stringify(domain_save)}, {uuid: order_info['uuid']})
+    await saves.updateDB(env.DB_CF, "Apply", {flag: status_flag}, {uuid: order_info['uuid']})
+    if (status_flag == -1) await saves.updateDB(env.DB_CF, "Apply", {
+        text: "域名验证失败:" + JSON.stringify(domain_fail)
+    }, {uuid: order_info['uuid']})
+    else await saves.updateDB(env.DB_CF, "Apply", {text: "域名验证通过"}, {uuid: order_info['uuid']})
+    return {"texts": "处理成功"};
+}
+
+// 完成证书申请 #######################################################################################################
+export async function getCerts(env: Bindings, order_user: any, order_info: any) {
+    let orders_text: any = JSON.parse(order_info['data'])
+    let client_data: any = await getStart(env, order_user, order_info);
+    let orders_data: any = await client_data.getOrder(orders_text); // 获取授权信息
+    // console.log(orders_data);
+    console.log('Orders Remote Verify Status:', orders_data.status);
+    if (orders_data.status == "invalid") {
+        await saves.updateDB(env.DB_CF, "Apply", {flag: -1}, {uuid: order_info['uuid']})
+        await saves.updateDB(env.DB_CF, "Apply", {text: "证书签发失败"}, {uuid: order_info['uuid']})
+        return {"texts": "验证状态无效"};
+    }
+    if (orders_data.status === 'ready') {
+        let domainsListCSR: any = await getNames(order_info, false);
+        let privateKeyText = null // 私钥创建过程 ===================================================================
+        if (order_info['type'] == "rsa2048") privateKeyText = await acme.crypto.createPrivateRsaKey(2048);
+        if (order_info['type'] == "eccp256") privateKeyText = await acme.crypto.createPrivateEcdsaKey('P-256');
+        if (order_info['type'] == "eccp384") privateKeyText = await acme.crypto.createPrivateEcdsaKey('P-384');
+        let [privateKeyBuff, certificateCSR] = await acme.crypto.createCsr({ // 创建证书请求 ==============================
+            altNames: domainsListCSR, commonName: domainsListCSR[0], country: order_info['C'], state: order_info['S'],
+            locality: order_info['ST'], organization: order_info['O'], organizationUnit: order_info['OU']
+        }, privateKeyText || "");
+        await saves.updateDB(env.DB_CF, "Apply", {keys: privateKeyBuff.toString()}, {uuid: order_info['uuid']})
+        const finish_text: any = await client_data.finalizeOrder(orders_data, certificateCSR);// 最终确认订单
+        console.log('Orders Remote Finish Status:', finish_text);
+        await saves.updateDB(env.DB_CF, "Apply", {text: "证书签发请求提交成功"}, {uuid: order_info['uuid']})
+    }
+    if (orders_data.status === 'processing') {
+        console.log('Orders Remote Finish Status:', "Certificate Processing");
+        await saves.updateDB(env.DB_CF, "Apply", {text: "证书正在等待完成签发"}, {uuid: order_info['uuid']})
+    }
+    if (orders_data.status === 'valid') {
+        const certificate: any = await client_data.getCertificate(orders_data);// 获取证书
+        // console.log('Orders Remote Issues Status:', certificate);
+        await saves.updateDB(env.DB_CF, "Apply", {cert: certificate}, {uuid: order_info['uuid']})
+        await saves.updateDB(env.DB_CF, "Apply", {flag: 5}, {uuid: order_info['uuid']})
+        const timestamp = new Date(new Date().setDate(new Date().getDate() + 90)).getTime();
+        await saves.updateDB(env.DB_CF, "Apply", {next: timestamp}, {uuid: order_info['uuid']})
+        await saves.updateDB(env.DB_CF, "Apply", {text: "恭喜！证书已成功签发"}, {uuid: order_info['uuid']})
+        // await saves.updateDB(env.DB, "Apply", {data: ""}, {uuid: order_info['uuid']})
+    }
+    return {"texts": "处理成功"};
+}
+
+// 吊销证书 ########################################################################################
+// RFC 5280 吊销原因码（Let's Encrypt 目前常用支持：0/1/3/4/5）
+// 参考：https://datatracker.ietf.org/doc/html/rfc5280#section-5.3.1
+//  0 unspecified            未指定（默认）
+//  1 keyCompromise          密钥已泄露
+//  3 affiliationChanged     归属关系变更
+//  4 superseded             已被新证书替代
+//  5 cessationOfOperation   停止运营
+export const REVOKE_REASONS = new Set<number>([0, 1, 2, 3, 4, 5, 6, 8, 9, 10]);
+
+export async function revokeCert(env: Bindings, order_info: any, reason: number = 0) {
+    // 基本校验：必须存在证书原文 =====================================================================
+    const cert_pem: string = order_info?.cert || "";
+    if (!cert_pem || !/BEGIN CERTIFICATE/.test(cert_pem)) {
+        return {"flags": 5, "texts": "当前订单未签发证书，无需吊销"};
+    }
+    // 读取申请者信息用于获取 ACME 账户上下文 =========================================================
+    let order_user: any = (await saves.selectDB(
+        env.DB_CF, "Users", {mail: {value: order_info['mail']}}))[0];
+    if (!order_user) return {"flags": 5, "texts": "找不到订单对应的用户信息"};
+    // 组装 ACME Client ============================================================================
+    let client_data: any;
+    try {
+        client_data = await getStart(env, order_user, order_info);
+    } catch (e) {
+        const msg = extractAcmeError(e);
+        return {"flags": 5, "texts": "ACME 账户初始化失败: " + msg};
+    }
+    if (client_data == null) return {"flags": 5, "texts": "ACME 账户初始化失败"};
+    // 规整 reason 参数 =============================================================================
+    let reason_code = Number(reason);
+    if (!Number.isFinite(reason_code) || !REVOKE_REASONS.has(reason_code)) reason_code = 0;
+    // 调用 ACME 吊销接口 ===========================================================================
+    try {
+        await client_data.revokeCertificate(cert_pem, {reason: reason_code});
+    } catch (e: any) {
+        const msg = extractAcmeError(e);
+        console.error("revokeCert acme error:", e);
+        // 记录失败原因，但不修改订单状态，允许用户重新尝试
+        try {
+            await saves.updateDB(env.DB_CF, "Apply",
+                {text: "证书吊销失败: " + msg},
+                {uuid: order_info['uuid']});
+        } catch {/* ignore */}
+        return {"flags": 5, "texts": "证书吊销失败: " + msg};
+    }
+    // 吊销成功：更新订单状态为已失效（-1），并清空 cert/keys，便于用户重新申请 =========================
+    const timestamp = Date.now();
+    await saves.updateDB(env.DB_CF, "Apply",
+        {flag: -1, text: "证书已吊销 (reason=" + reason_code + ")", next: timestamp},
+        {uuid: order_info['uuid']});
+    return {"flags": 0, "texts": "证书吊销成功"};
+}
+
+// 获取域名信息 ####################################################################################
+async function getNames(order_info: any, full: boolean = false) {
+    // 处理域名信息 ================================================================================
+    let domain_save: string[] | Record<string, any> = [];
+    let domain_data = JSON.parse(order_info['list']);
+    for (const uid in domain_data) {
+        const domain_now = domain_data[uid];
+        // console.log("domain_now: ", domain_now);
+        const author_now = domain_now['type'].split("-")[0]
+        // 判断是否为IP证书
+        const isIP = !!domain_now['isIP'];
+        if (full) {
+            domain_save.push({
+                type: isIP ? 'ip' : author_now,
+                value: domain_now['name']
+            });
+        } else {
+            domain_save.push(domain_now['name']);
+        }
+    }
+    return domain_save;
+}
+
+// 获取操作接口 ####################################################################################
+async function getStart(env: Bindings, order_user: any, order_info: any) {
+    let acme_url = acme_url_map[order_info['sign']];
+    // 从 Confs 优先读取三家 CA 的账户凭据（回退到 env / 默认值）
+    const [GTS_KeyTS, GTS_keyID, GTS_keyMC,
+        SSL_KeyTS, SSL_keyID, SSL_keyMC,
+        ZRO_KeyTS, ZRO_keyID, ZRO_keyMC] = await Promise.all([
+        readConf(env as any, "GTS_KeyTS"),
+        readConf(env as any, "GTS_keyID"),
+        readConf(env as any, "GTS_keyMC"),
+        readConf(env as any, "SSL_KeyTS"),
+        readConf(env as any, "SSL_keyID"),
+        readConf(env as any, "SSL_keyMC"),
+        readConf(env as any, "ZRO_KeyTS"),
+        readConf(env as any, "ZRO_keyID"),
+        readConf(env as any, "ZRO_keyMC"),
+    ]);
+    const acme_key_map: Record<string, any> = {
+        "lets-encrypt": order_user['keys'],
+        "google-trust": GTS_KeyTS,
+        "bypass-trust": order_user['keys'],
+        "zeroca-trust": ZRO_KeyTS,
+        "sslcom-trust": SSL_KeyTS,
+    }
+    const acme_eab_map: Record<string, any> = {
+        "lets-encrypt": undefined,
+        "google-trust": {kid: GTS_keyID, hmacKey: GTS_keyMC,},
+        "bypass-trust": undefined,
+        "zeroca-trust": {kid: ZRO_keyID, hmacKey: ZRO_keyMC,},
+        "sslcom-trust": {kid: SSL_keyID, hmacKey: SSL_keyMC,}
+    }
+    if (order_info['sign'] == "sslcom-trust") acme_url += order_info['type'].substring(0, 3);
+    let client_data: Client = new acme.Client({
+        directoryUrl: acme_url,
+        accountKey: acme_key_map[order_info.sign],
+        externalAccountBinding: acme_eab_map[order_info.sign],
+    });
+    try { // 获取账户信息 ================================
+        client_data.getAccountUrl();
+    } catch (e) { // 尝试创建账户 ========================
+        try {
+            await client_data.createAccount({
+                termsOfServiceAgreed: true,
+                contact: ['mailto:' + order_user['mail']],
+            });
+        } catch (e) {
+            if (e instanceof Error) {
+                console.error("Error stack:", e.stack);
+                console.error("Error message:", e.message);
+            } else {
+                console.error("An unknown error occurred:", e);
+            }
+            throw e;
+            // return null
+        }
+    }
+    return client_data;
+}
+
+// 获取验证数据 ####################################################################################
+async function getAuthy(client_data: any, orders_data: any) {
+    let author_list: any[] = await client_data.getAuthorizations(orders_data);
+    let author_maps: Record<string, any> = {}
+    // console.log("author_list: ", author_list);
+    for (const author_data of author_list) {
+        // 待验证信息 ======================================
+        let author_info: any = author_data['identifier'];
+        let author_name: string = author_info['value'];
+        if (author_data['wildcard'] === true)
+            author_name = "*." + author_name;
+        // let author_type: string = author_info['type'];
+        // 查找验证信息（优先dns-01，IP证书使用http-01）=================================
+        let author_save = undefined
+        // console.log(author_data)
+        for (const c of author_data['challenges']) {
+            if (c.type === "dns-01") {
+                author_save = c
+                break
+            }
+        }
+        // 如果没有dns-01（如IP证书），尝试http-01
+        if (author_save == undefined) {
+            for (const c of author_data['challenges']) {
+                if (c.type === "http-01") {
+                    author_save = c
+                    break
+                }
+            }
+        }
+        if (author_save == undefined) continue
+        let author_text = await client_data.getChallengeKeyAuthorization(author_save)
+        console.log(author_text);
+        // 返回结果 ========================================
+        // console.log(author_name, author_type, author_save['token']);
+        author_maps[author_name] = {
+            text: author_text,
+            data: author_save,
+            auth: author_data,
+        }
+    }
+    // console.log(author_maps);
+    return author_maps;
+}
+
+async function dnsCheck(author_save: any, domain_item: any) {
+    if (author_save[domain_item.name] == undefined) return false;
+    // 设置数据 =============================================
+    let domain_name = domain_item.name.replaceAll("*.", "")
+    let author_text = domain_item.auth; // 目标解析记录
+    let domain_type = "TXT" // 待验证域名格式文本TXT
+    if (domain_item.type == "dns-auto") { // 如果DNS-AUTO模式
+        domain_type = "CNAME" // 此时需检查CNAME而不是TXT记录
+        author_text = domain_item.auto // 验证内容也改为CNAME
+    } // 查询DNS ============================================
+    let author_flag: boolean = false // 任意一个DNS正确则通过
+    let record_list: any = await query.queryDNS(
+        "_acme-challenge." + domain_name, domain_type)
+    // console.log('Records for', domain_name, ':');
+    for (let record_item of record_list) { // 查询所有DNS记录
+        // console.log(record_item['data']);
+        // console.log(author_text);
+        if (record_item['data'] == author_text) {
+            author_flag = true;
+            break;
+        }
+    }
+    // console.log(author_flag);
+    return author_flag;
+}
+
+async function dnsOrder(author_save: any, domain_item: any) {
+
+}
